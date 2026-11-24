@@ -112,6 +112,12 @@ export async function geminiCall(body: Record<string, unknown>, signal: AbortSig
   }
 }
 
+// Todos os modelos falharam nos últimos 2 minutos: com IA reserva, nem tenta o Gemini.
+export function geminiAllCooling(): boolean {
+  const now = Date.now();
+  return geminiModels().every((m) => (coolDown.get(m) ?? 0) > now);
+}
+
 export function friendlyGeminiError(e: GeminiError): string {
   if (e.status === 429) return "O limite gratuito da IA foi atingido agora. Tente de novo em 1 minuto.";
   if (e.status === 401 || e.status === 403 || /API key|API_KEY/i.test(e.message))
@@ -129,7 +135,8 @@ export async function runGemini(opts: {
   signal: AbortSignal;
   maxRounds: number;
   deadline: number; // horário limite (ms) para terminar antes do tempo máximo da função
-}) {
+  fallback?: boolean; // há IA reserva: em falha antes de escrever qualquer coisa, devolve false sem mensagem de erro
+}): Promise<boolean> {
   const contents: Content[] = opts.messages.map((m) => ({
     role: m.role === "assistant" ? "model" : "user",
     parts: [{ text: m.content }],
@@ -153,8 +160,9 @@ export async function runGemini(opts: {
   for (let round = 0; round <= opts.maxRounds; round++) {
     const left = opts.deadline - Date.now();
     if (left < 5000) {
+      if (opts.fallback && !wrote) return false;
       out(wrote ? "\n\n(Tempo esgotado ao consultar mais dados.)" : "Demorei demais para consultar os dados. Tente de novo ou faça uma pergunta mais específica.");
-      return;
+      return true;
     }
     // Na última rodada, pede a resposta final sem novas consultas.
     const lastRound = round === opts.maxRounds || left < 20000;
@@ -173,12 +181,14 @@ export async function runGemini(opts: {
       );
     } catch (e) {
       if (e instanceof GeminiError) {
+        if (opts.fallback && !wrote) return false;
         out((wrote ? "\n\n" : "") + friendlyGeminiError(e));
-        return;
+        return true;
       }
       if (e instanceof Error && (e.name === "TimeoutError" || e.name === "AbortError") && !opts.signal.aborted) {
+        if (opts.fallback && !wrote) return false;
         out((wrote ? "\n\n" : "") + "A IA demorou demais para responder. Tente de novo.");
-        return;
+        return true;
       }
       throw e;
     }
@@ -187,16 +197,21 @@ export async function runGemini(opts: {
     if (!cand?.content?.parts?.length) {
       const why = json.promptFeedback?.blockReason || cand?.finishReason || "sem conteúdo";
       console.error("gemini resposta vazia:", why);
+      const blocked = /SAFETY|BLOCK|PROHIBITED/i.test(why);
+      if (opts.fallback && !wrote && !blocked) return false;
       out((wrote ? "\n\n" : "") + (/SAFETY|BLOCK|PROHIBITED/i.test(why) ? "Não consigo responder a este pedido." : "A IA não gerou resposta desta vez. Tente de novo."));
-      return;
+      return true;
     }
     const parts = cand.content.parts;
     const text = parts.filter((p) => p.text && !p.thought).map((p) => p.text).join("");
     if (text) out(text);
     const calls = parts.filter((p) => p.functionCall);
     if (calls.length === 0 || lastRound) {
-      if (!text && !wrote) out("A IA não gerou resposta desta vez. Tente de novo.");
-      return;
+      if (!text && !wrote) {
+        if (opts.fallback) return false;
+        out("A IA não gerou resposta desta vez. Tente de novo.");
+      }
+      return true;
     }
     // Devolve o conteúdo do modelo como veio (inclui assinaturas de raciocínio exigidas pelo Gemini 3).
     contents.push({ role: "model", parts });
@@ -216,4 +231,5 @@ export async function runGemini(opts: {
     );
     contents.push({ role: "user", parts: results });
   }
+  return true;
 }

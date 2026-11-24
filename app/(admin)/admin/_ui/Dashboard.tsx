@@ -111,7 +111,7 @@ export function Dashboard(props: {
 
         {!store && (
           <div className="adm-notice">
-            <b>Sem armazenamento conectado.</b> Conecte um banco Redis na Vercel (Storage &gt; Redis &gt; Connect) e faça Redeploy: a Vercel só entrega as variáveis novas ao site depois de um novo deploy. Até lá, nada é contado e nenhum número é inventado.
+            <b>Sem armazenamento conectado.</b> Conecte um banco (Supabase/Postgres ou Redis) na Vercel em Storage e faça Redeploy: a Vercel só entrega as variáveis novas ao site depois de um novo deploy. Até lá, nada é contado e nenhum número é inventado.
           </div>
         )}
 

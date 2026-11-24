@@ -3,8 +3,10 @@
 //  - REST (Upstash): KV_REST_API_URL/KV_REST_API_TOKEN ou UPSTASH_REDIS_REST_URL/UPSTASH_REDIS_REST_TOKEN
 //    (ou qualquer PREFIXO_REST_API_URL/PREFIXO_REST_API_TOKEN);
 //  - conexão direta (Redis): REDIS_URL, STORAGE_URL, KV_URL ou qualquer PREFIXO_URL com redis:// ou rediss://.
+// Sem Redis, usa Postgres (Supabase): POSTGRES_URL, DATABASE_URL, POSTGRES_PRISMA_URL ou POSTGRES_URL_NON_POOLING.
 // Sem nenhuma delas, nada é gravado e o painel avisa que não há armazenamento (sem números inventados).
 import type { RedisClientType } from "redis";
+import { findPgUrl, pg, pgDays, pgEvent, pgIncr, pgRecentEvents, pgSubDel, pgSubList, pgSubPut, pgVisitor } from "./pgstore";
 
 function findRest(): { url: string; token: string } | null {
   const e = process.env;
@@ -26,7 +28,10 @@ function findTcpUrl(): string | null {
   return null;
 }
 
-export const hasStore = () => !!(findRest() || findTcpUrl());
+const hasRedis = () => !!(findRest() || findTcpUrl());
+const usePg = () => !hasRedis() && !!findPgUrl();
+export const hasStore = () => hasRedis() || !!findPgUrl();
+export const storeKind = (): "Redis" | "Postgres" | null => (hasRedis() ? "Redis" : findPgUrl() ? "Postgres" : null);
 
 let tcpClient: Promise<RedisClientType | null> | null = null;
 function getTcp(): Promise<RedisClientType | null> {
@@ -111,6 +116,10 @@ async function visitorHash(ip: string, day: string): Promise<string> {
 export async function trackPageView(ip: string, path: string) {
   const day = dayKey();
   const h = await visitorHash(ip, day);
+  if (usePg()) {
+    await Promise.all([pgIncr(day, [["views", 1], [`page:${path}`, 1]]), pgVisitor(day, h)]);
+    return;
+  }
   await redis([
     ["HINCRBY", `im:d:${day}`, "views", 1],
     ["HINCRBY", `im:d:${day}`, `page:${path}`, 1],
@@ -122,6 +131,10 @@ export async function trackPageView(ip: string, path: string) {
 
 export async function trackCounter(field: string) {
   const day = dayKey();
+  if (usePg()) {
+    await pgIncr(day, [[field, 1]]);
+    return;
+  }
   await redis([
     ["HINCRBY", `im:d:${day}`, field, 1],
     ["EXPIRE", `im:d:${day}`, RETENTION_S],
@@ -130,7 +143,12 @@ export async function trackCounter(field: string) {
 
 export async function trackSecurity(reason: string, ip: string, path: string) {
   const day = dayKey();
-  const ev = JSON.stringify({ reason, ip: maskIp(ip), path: path.slice(0, 80), at: new Date().toISOString() });
+  const obj = { reason, ip: maskIp(ip), path: path.slice(0, 80), at: new Date().toISOString() };
+  if (usePg()) {
+    await Promise.all([pgIncr(day, [[`sec:${reason}`, 1], ["blocked", 1]]), pgEvent(obj)]);
+    return;
+  }
+  const ev = JSON.stringify(obj);
   await redis([
     ["HINCRBY", `im:d:${day}`, `sec:${reason}`, 1],
     ["HINCRBY", `im:d:${day}`, "blocked", 1],
@@ -144,6 +162,10 @@ export async function trackSecurity(reason: string, ip: string, path: string) {
 export type Subscriber = { name: string; email: string; consentAt: string; policy: string };
 
 export async function addSubscriber(s: Subscriber) {
+  if (usePg()) {
+    await Promise.all([pgSubPut(s.email, s), pgIncr(dayKey(), [["signups", 1]])]);
+    return;
+  }
   await redis([
     ["HSET", "im:subs", s.email, JSON.stringify(s)],
     ["HINCRBY", `im:d:${dayKey()}`, "signups", 1],
@@ -151,10 +173,18 @@ export async function addSubscriber(s: Subscriber) {
 }
 
 export async function removeSubscriber(email: string) {
+  if (usePg()) {
+    await pgSubDel(email);
+    return;
+  }
   await redis([["HDEL", "im:subs", email]]);
 }
 
 export async function listSubscribers(): Promise<Subscriber[] | null> {
+  if (usePg()) {
+    const rows = (await pgSubList()) as Subscriber[] | null;
+    return rows ? rows.sort((a, b) => b.consentAt.localeCompare(a.consentAt)) : null;
+  }
   const r = await redis([["HVALS", "im:subs"]]);
   if (!r) return null;
   const vals = (r[0] as string[] | null) ?? [];
@@ -176,6 +206,24 @@ export async function lastDays(n: number): Promise<DayStats[] | null> {
   if (!hasStore()) return null;
   const days: string[] = [];
   for (let i = n - 1; i >= 0; i--) days.push(dayKey(new Date(Date.now() - i * 86400000)));
+  if (usePg()) {
+    const r = await pgDays(days);
+    if (!r) return null;
+    return days.map((day) => {
+      const fields: Record<string, number> = {};
+      for (const x of r.daily) if (x.day === day) fields[x.field] = x.n;
+      return {
+        day,
+        views: fields.views ?? 0,
+        visitors: r.visitors.find((v) => v.day === day)?.c ?? 0,
+        chats: fields.chats ?? 0,
+        radar: fields.radar ?? 0,
+        blocked: fields.blocked ?? 0,
+        signups: fields.signups ?? 0,
+        fields,
+      };
+    });
+  }
   const cmds: (string | number)[][] = [];
   for (const d of days) {
     cmds.push(["HGETALL", `im:d:${d}`]);
@@ -203,6 +251,7 @@ export async function lastDays(n: number): Promise<DayStats[] | null> {
 export type SecEvent = { reason: string; ip: string; path: string; at: string };
 
 export async function recentSecurity(n = 50): Promise<SecEvent[] | null> {
+  if (usePg()) return (await pgRecentEvents(n)) as SecEvent[] | null;
   const r = await redis([["LRANGE", "im:sec:events", 0, n - 1]]);
   if (!r) return null;
   return ((r[0] as string[] | null) ?? []).flatMap((v) => {
@@ -212,4 +261,11 @@ export async function recentSecurity(n = 50): Promise<SecEvent[] | null> {
       return [];
     }
   });
+}
+
+// Teste real de leitura e gravação no banco (usado por /api/health).
+export async function storePing(): Promise<boolean> {
+  if (usePg()) return (await pg((sql) => sql`SELECT 1 FROM invest_moment.im_daily LIMIT 1`)) !== null;
+  const r = await redis([["PING"]]);
+  return !!r && r[0] === "PONG";
 }

@@ -23,7 +23,7 @@ export default function Privacidade() {
       <p>Cadastro: enviar o Radar do dia e novidades do Invest Moment (base legal: consentimento). Estatísticas e segurança: manter o site funcionando e protegido (base legal: legítimo interesse).</p>
 
       <h3>Com quem compartilhamos</h3>
-      <p>Não vendemos dados. Usamos fornecedores para operar o site: Vercel (hospedagem), Upstash (armazenamento), Google (IA), brapi.dev (cotações) e Firecrawl (notícias).</p>
+      <p>Não vendemos dados. Usamos fornecedores para operar o site: Vercel (hospedagem), Supabase (armazenamento), Google e Mistral (IA), brapi.dev (cotações) e Firecrawl (notícias).</p>
 
       <h3>Seus direitos</h3>
       <p>Você pode pedir acesso, correção ou exclusão dos seus dados e retirar o consentimento a qualquer momento{contato ? <> pelo e-mail <a href={`mailto:${contato}`}>{contato}</a></> : " pelos canais de contato do Invest Moment"}.</p>

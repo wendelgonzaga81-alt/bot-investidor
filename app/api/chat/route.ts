@@ -2,7 +2,8 @@ import Anthropic from "@anthropic-ai/sdk";
 import { z } from "zod";
 import { SYSTEM_PROMPT, contextBlock } from "@/lib/prompt";
 import { TOOL_DEFS, runTool } from "@/lib/tools";
-import { runGemini } from "@/lib/gemini";
+import { geminiAllCooling, runGemini } from "@/lib/gemini";
+import { hasBackup, runBackup } from "@/lib/ai-backup";
 import { looksLikeInjection, scrubSecrets, securityLog } from "@/lib/guard";
 
 export const runtime = "nodejs";
@@ -20,14 +21,37 @@ const Body = z.object({
     .max(40),
 });
 
-// Provedor: AI_PROVIDER ("gemini" ou "anthropic") se definido; senão Gemini quando houver GEMINI_API_KEY,
-// e Anthropic como alternativa quando só houver ANTHROPIC_API_KEY.
-function provider(): "gemini" | "anthropic" | null {
+// Provedor: AI_PROVIDER ("gemini", "groq" ou "anthropic") se definido; senão Gemini quando houver GEMINI_API_KEY,
+// a IA reserva (Mistral, OpenRouter ou Groq) quando só houver a chave dela, e Anthropic quando só houver ANTHROPIC_API_KEY.
+// Com Gemini e reserva configurados, a reserva entra sozinho quando o Gemini falha ou demora.
+function provider(): "gemini" | "backup" | "anthropic" | null {
   const forced = process.env.AI_PROVIDER?.toLowerCase();
   if (forced === "gemini" && process.env.GEMINI_API_KEY) return "gemini";
+  if ((forced === "mistral" || forced === "groq" || forced === "openrouter") && hasBackup()) return "backup";
   if (forced === "anthropic" && process.env.ANTHROPIC_API_KEY) return "anthropic";
   if (process.env.GEMINI_API_KEY) return "gemini";
+  if (hasBackup()) return "backup";
   if (process.env.ANTHROPIC_API_KEY) return "anthropic";
+  return null;
+}
+
+// Cache curto para perguntas gerais de mercado (iguais para todos), como "Bolsa hoje".
+// O nome do usuário é trocado por um marcador antes de guardar, para não aparecer a outra pessoa.
+const CACHE_MS = 5 * 60_000;
+const NAME_MARK = "\u0000NOME\u0000";
+const answerCache = new Map<string, { at: number; text: string }>();
+function cacheKey(messages: { role: string; content: string }[]): string | null {
+  if (messages.length > 2) return null; // só a primeira pergunta da conversa (sem contexto anterior)
+  const q = messages[messages.length - 1].content
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9 ]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (/^(como esta a )?bolsa (de )?hoje$|^radar( do dia)?$|^ibovespa hoje$|^mercado hoje$|^resumo do mercado$/.test(q)) return q;
+  if (/^onde estao os olhos dos investidores$/.test(q)) return q;
+  if (/^qual acao esta melhor para os proximos 20 pregoes$/.test(q)) return q;
   return null;
 }
 
@@ -102,7 +126,7 @@ async function runAnthropic(opts: {
 export async function POST(req: Request) {
   const p = provider();
   if (!p) {
-    return new Response("O servidor ainda não tem a chave da IA configurada (GEMINI_API_KEY).", { status: 500 });
+    return new Response("O servidor ainda não tem a chave da IA configurada (GEMINI_API_KEY ou MISTRAL_API_KEY).", { status: 500 });
   }
   const parsed = Body.safeParse(await req.json().catch(() => null));
   if (!parsed.success) return new Response("Pedido inválido.", { status: 400 });
@@ -144,30 +168,67 @@ export async function POST(req: Request) {
     );
   }
 
+  const nome = parsed.data.name.replace(/\s+/g, " ").trim().slice(0, 80);
+  const key = cacheKey(messages);
+  const hit = key ? answerCache.get(key) : undefined;
+  if (hit && Date.now() - hit.at < CACHE_MS) {
+    return new Response(hit.text.split(NAME_MARK).join(nome || "investidor"), {
+      headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" },
+    });
+  }
+
   const encoder = new TextEncoder();
   const started = Date.now();
   const body = new ReadableStream<Uint8Array>({
     async start(controller) {
-      const write = (s: string) => controller.enqueue(encoder.encode(scrubSecrets(s)));
+      let full = "";
+      let failed = false;
+      const write = (s: string) => {
+        const clean = scrubSecrets(s);
+        full += clean;
+        controller.enqueue(encoder.encode(clean));
+      };
+      const system = `${SYSTEM_PROMPT}\n\n${contextBlock(parsed.data.name, new Date())}`;
+      const base = { system, messages, write, signal: req.signal, maxRounds: MAX_TOOL_ROUNDS };
       try {
         if (p === "gemini") {
-          await runGemini({
-            system: `${SYSTEM_PROMPT}\n\n${contextBlock(parsed.data.name, new Date())}`,
-            messages,
-            write,
-            signal: req.signal,
-            maxRounds: MAX_TOOL_ROUNDS,
-            deadline: started + DEADLINE_MS,
-          });
+          const backup = hasBackup();
+          let done = false;
+          if (!(backup && geminiAllCooling())) {
+            // Com reserva: o Gemini tem até 28 s; se falhar sem escrever nada, a reserva responde no tempo restante.
+            done = await runGemini({ ...base, deadline: started + (backup ? 28_000 : DEADLINE_MS), fallback: backup });
+          }
+          if (!done) {
+            const ok = await runBackup({ ...base, deadline: started + DEADLINE_MS });
+            if (!ok) {
+              failed = true;
+              write("As IAs gratuitas estão sobrecarregadas neste momento. Tente de novo em 1 minuto.");
+            }
+          }
+        } else if (p === "backup") {
+          const ok = await runBackup({ ...base, deadline: started + DEADLINE_MS });
+          if (!ok) {
+            failed = true;
+            write("A IA está sobrecarregada neste momento. Tente de novo em 1 minuto.");
+          }
         } else {
           await runAnthropic({ name: parsed.data.name, messages, write, signal: req.signal });
         }
       } catch (e) {
         if (!(e instanceof Error && e.name === "AbortError")) {
           console.error("chat:", (e as Error)?.message);
+          failed = true;
           write("\n\nFalha ao gerar a resposta. Tente de novo.");
         }
       } finally {
+        // Guarda no cache só respostas completas (sem aviso de erro ou tempo esgotado).
+        if (key && !failed && full.length > 80 && !/Tente de novo|Tempo esgotado|demorou demais/i.test(full)) {
+          let text = nome ? full.split(nome).join(NAME_MARK) : full;
+          const first = nome.split(" ")[0];
+          if (first && first !== nome && first.length >= 3) text = text.split(first).join(NAME_MARK);
+          answerCache.set(key, { at: Date.now(), text });
+          if (answerCache.size > 50) answerCache.delete(answerCache.keys().next().value!);
+        }
         controller.close();
       }
     },

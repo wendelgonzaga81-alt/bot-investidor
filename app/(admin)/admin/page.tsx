@@ -1,7 +1,7 @@
 // Painel administrativo (backend). Renderizado só no servidor; exige sessão de administrador.
 import { cookies } from "next/headers";
 import { ADMIN_COOKIE, adminConfigured, verifySession } from "@/lib/admin/auth";
-import { hasStore, lastDays, listSubscribers, recentSecurity } from "@/lib/store";
+import { hasStore, lastDays, listSubscribers, recentSecurity, storeKind } from "@/lib/store";
 import { LoginForm } from "./_ui/LoginForm";
 import { Dashboard } from "./_ui/Dashboard";
 
@@ -35,7 +35,7 @@ export default async function AdminPage() {
           { name: "IA (Gemini/Claude)", ok: !!(process.env.GEMINI_API_KEY || process.env.ANTHROPIC_API_KEY) },
           { name: "Cotações (brapi)", ok: !!process.env.BRAPI_TOKEN },
           { name: "Notícias (Firecrawl)", ok: !!process.env.FIRECRAWL_API_KEY },
-          { name: "Armazenamento (Redis)", ok: hasStore() },
+          { name: `Armazenamento (${storeKind() ?? "Redis ou Postgres"})`, ok: hasStore() },
           { name: "Assinatura do painel (ADMIN_SECRET)", ok: !!process.env.ADMIN_SECRET },
         ],
         lockdown: process.env.SITE_LOCKDOWN === "1",
