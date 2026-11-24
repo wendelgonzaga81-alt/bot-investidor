@@ -36,7 +36,7 @@ function cleanMsg(m: string | undefined): string {
 }
 
 // Uma chamada generateContent, com troca automática de modelo se o atual não existir.
-export async function geminiCall(body: unknown, signal: AbortSignal): Promise<GenResponse> {
+async function geminiCallOnce(body: unknown, signal: AbortSignal): Promise<GenResponse> {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new GeminiError(500, "GEMINI_API_KEY não configurada");
   const models = workingModel ? [workingModel, ...geminiModels().filter((m) => m !== workingModel)] : geminiModels();
@@ -57,11 +57,32 @@ export async function geminiCall(body: unknown, signal: AbortSignal): Promise<Ge
     const msg = cleanMsg(json.error?.message);
     console.error(`gemini ${model} ${res.status}: ${msg}`);
     last = new GeminiError(res.status, msg || res.statusText);
-    // Modelo inexistente ou não liberado para a chave: tenta o próximo.
-    if (res.status === 404 || (res.status === 400 && /model/i.test(msg) && /not found|not supported|unknown/i.test(msg))) continue;
+    // Modelo inexistente, sobrecarregado (503/500) ou sem cota (429): tenta o próximo modelo grátis.
+    if (
+      res.status === 404 ||
+      res.status === 429 ||
+      res.status >= 500 ||
+      (res.status === 400 && /model/i.test(msg) && /not found|not supported|unknown/i.test(msg))
+    ) {
+      if (workingModel === model) workingModel = null;
+      continue;
+    }
     throw last;
   }
   throw last ?? new GeminiError(500, "nenhum modelo disponível");
+}
+
+// Se todos os modelos estiverem sobrecarregados, espera um pouco e tenta mais uma vez.
+export async function geminiCall(body: unknown, signal: AbortSignal): Promise<GenResponse> {
+  try {
+    return await geminiCallOnce(body, signal);
+  } catch (e) {
+    if (e instanceof GeminiError && (e.status >= 500 || e.status === 429) && !signal.aborted) {
+      await new Promise((r) => setTimeout(r, 2500));
+      return geminiCallOnce(body, signal);
+    }
+    throw e;
+  }
 }
 
 export function friendlyGeminiError(e: GeminiError): string {
@@ -69,7 +90,7 @@ export function friendlyGeminiError(e: GeminiError): string {
   if (e.status === 401 || e.status === 403 || /API key|API_KEY/i.test(e.message))
     return "A chave da IA (GEMINI_API_KEY) foi recusada pelo Google. Confira a chave na Vercel.";
   if (e.status === 404) return "Nenhum modelo Gemini disponível para esta chave.";
-  if (e.status >= 500) return "A IA do Google está instável agora. Tente de novo em instantes.";
+  if (e.status >= 500) return "A IA do Google está sobrecarregada neste momento. Tente de novo em 1 minuto.";
   return `A IA recusou o pedido (${e.status}). Tente reformular a pergunta.`;
 }
 
