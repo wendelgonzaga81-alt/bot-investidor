@@ -163,5 +163,6 @@ export async function middleware(req: NextRequest, event: NextFetchEvent) {
 }
 
 export const config = {
+  runtime: "nodejs", // Node.js no middleware (estável no Next 15.5) para falar com o Redis por conexão direta
   matcher: ["/((?!_next/static|_next/image|favicon.ico|icon.svg|logo.png|banner.png).*)"],
 };
