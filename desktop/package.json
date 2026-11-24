@@ -1,0 +1,29 @@
+{
+  "name": "invest-moment-desktop",
+  "productName": "Invest Moment",
+  "version": "1.0.0",
+  "description": "Aplicativo de computador do Invest Moment (site + painel administrativo).",
+  "main": "main.js",
+  "author": "Invest Moment",
+  "license": "UNLICENSED",
+  "scripts": {
+    "start": "electron .",
+    "dist:win": "electron-builder --win nsis portable",
+    "dist:mac": "electron-builder --mac dmg",
+    "dist:linux": "electron-builder --linux AppImage"
+  },
+  "devDependencies": {
+    "electron": "33.2.1",
+    "electron-builder": "25.1.8"
+  },
+  "build": {
+    "appId": "app.investmoment.desktop",
+    "productName": "Invest Moment",
+    "directories": { "output": "dist" },
+    "files": ["main.js", "preload.js", "config.json", "icon.png"],
+    "win": { "icon": "icon.png", "target": ["nsis", "portable"] },
+    "nsis": { "oneClick": false, "allowToChangeInstallationDirectory": true, "createDesktopShortcut": true, "shortcutName": "Invest Moment" },
+    "mac": { "icon": "icon.png", "category": "public.app-category.finance" },
+    "linux": { "icon": "icon.png", "category": "Office" }
+  }
+}
