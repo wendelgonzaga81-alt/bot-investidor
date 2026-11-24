@@ -47,6 +47,7 @@ async function brapiGet(path: string): Promise<unknown> {
   const res = await fetch(`${BRAPI}${path}`, {
     headers: token ? { Authorization: `Bearer ${token}` } : {},
     cache: "no-store",
+    signal: AbortSignal.timeout(10000),
   });
   if (!res.ok) {
     const body = await res.text().catch(() => "");

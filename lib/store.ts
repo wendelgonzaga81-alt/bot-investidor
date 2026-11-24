@@ -1,25 +1,88 @@
-// Armazenamento de métricas (Upstash Redis via REST, grátis pela Vercel Marketplace).
-// Variáveis: UPSTASH_REDIS_REST_URL/UPSTASH_REDIS_REST_TOKEN ou KV_REST_API_URL/KV_REST_API_TOKEN.
-// Sem elas, nada é gravado e o painel avisa que não há armazenamento (sem números inventados).
-// Funciona no middleware (edge) e nas rotas (node): só usa fetch e Web Crypto.
+// Armazenamento de métricas e cadastros (Redis).
+// Aceita as duas formas que a Vercel cria ao conectar um banco:
+//  - REST (Upstash): KV_REST_API_URL/KV_REST_API_TOKEN ou UPSTASH_REDIS_REST_URL/UPSTASH_REDIS_REST_TOKEN
+//    (ou qualquer PREFIXO_REST_API_URL/PREFIXO_REST_API_TOKEN);
+//  - conexão direta (Redis): REDIS_URL, STORAGE_URL, KV_URL ou qualquer PREFIXO_URL com redis:// ou rediss://.
+// Sem nenhuma delas, nada é gravado e o painel avisa que não há armazenamento (sem números inventados).
+import type { RedisClientType } from "redis";
 
-const URL_ = () => process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL || "";
-const TOKEN = () => process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN || "";
+function findRest(): { url: string; token: string } | null {
+  const e = process.env;
+  const pairs: [string | undefined, string | undefined][] = [
+    [e.KV_REST_API_URL, e.KV_REST_API_TOKEN],
+    [e.UPSTASH_REDIS_REST_URL, e.UPSTASH_REDIS_REST_TOKEN],
+  ];
+  for (const k of Object.keys(e)) {
+    if (k.endsWith("_REST_API_URL")) pairs.push([e[k], e[k.replace(/_URL$/, "_TOKEN")]]);
+  }
+  for (const [url, token] of pairs) if (url && token && /^https:\/\//.test(url)) return { url, token };
+  return null;
+}
 
-export const hasStore = () => !!(URL_() && TOKEN());
+function findTcpUrl(): string | null {
+  const e = process.env;
+  for (const k of ["REDIS_URL", "STORAGE_URL", "KV_URL"]) if (e[k] && /^rediss?:\/\//.test(e[k]!)) return e[k]!;
+  for (const k of Object.keys(e)) if (k.endsWith("_URL") && /^rediss?:\/\//.test(e[k] ?? "")) return e[k]!;
+  return null;
+}
 
+export const hasStore = () => !!(findRest() || findTcpUrl());
+
+let tcpClient: Promise<RedisClientType | null> | null = null;
+function getTcp(): Promise<RedisClientType | null> {
+  const url = findTcpUrl();
+  if (!url) return Promise.resolve(null);
+  if (!tcpClient) {
+    tcpClient = (async () => {
+      try {
+        const { createClient } = await import("redis");
+        const c = createClient({ url, socket: { connectTimeout: 1500, reconnectStrategy: (n) => (n > 3 ? false : 300) } }) as RedisClientType;
+        c.on("error", (err) => console.error("redis:", (err as Error).message));
+        await c.connect();
+        return c;
+      } catch (err) {
+        console.error("redis conexão:", (err as Error).message);
+        tcpClient = null;
+        return null;
+      }
+    })();
+  }
+  return tcpClient;
+}
+
+// Nunca deixa o banco travar o site: se não responder em 1,5 s, segue sem ele.
 export async function redis(commands: (string | number)[][]): Promise<unknown[] | null> {
-  if (!hasStore()) return null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<null>((r) => (timer = setTimeout(() => r(null), 1500)));
   try {
-    const res = await fetch(`${URL_()}/pipeline`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${TOKEN()}`, "Content-Type": "application/json" },
-      body: JSON.stringify(commands.map((c) => c.map(String))),
-      cache: "no-store",
-    });
-    if (!res.ok) return null;
-    const json = (await res.json()) as { result?: unknown; error?: string }[];
-    return json.map((r) => (r.error ? null : r.result));
+    return await Promise.race([redisRaw(commands), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function redisRaw(commands: (string | number)[][]): Promise<unknown[] | null> {
+  const rest = findRest();
+  if (rest) {
+    try {
+      const res = await fetch(`${rest.url}/pipeline`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${rest.token}`, "Content-Type": "application/json" },
+        body: JSON.stringify(commands.map((c) => c.map(String))),
+        cache: "no-store",
+        signal: AbortSignal.timeout(1500),
+      });
+      if (!res.ok) return null;
+      const json = (await res.json()) as { result?: unknown; error?: string }[];
+      return json.map((r) => (r.error ? null : r.result));
+    } catch {
+      return null;
+    }
+  }
+  const c = await getTcp();
+  if (!c) return null;
+  try {
+    return await Promise.all(commands.map((cmd) => c.sendCommand(cmd.map(String)).catch(() => null)));
   } catch {
     return null;
   }

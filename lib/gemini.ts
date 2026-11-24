@@ -35,20 +35,42 @@ function cleanMsg(m: string | undefined): string {
   return (m ?? "").replace(/AIza[0-9A-Za-z_-]{20,}/g, "[chave]").replace(/\s+/g, " ").slice(0, 180);
 }
 
-// Uma chamada generateContent, com troca automática de modelo se o atual não existir.
-async function geminiCallOnce(body: unknown, signal: AbortSignal): Promise<GenResponse> {
+const coolDown = new Map<string, number>();
+let thinkingCfgOk = true; // desliga sozinho se a API recusar o campo de raciocínio
+
+// Uma rodada pela lista de modelos. Cada modelo tem um tempo máximo; se demorar, estiver
+// sobrecarregado (503/500), sem cota (429) ou não existir (404), passa para o próximo (mais leve).
+async function geminiCallOnce(body: Record<string, unknown>, signal: AbortSignal, perCallMs: number): Promise<GenResponse> {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new GeminiError(500, "GEMINI_API_KEY não configurada");
-  const models = workingModel ? [workingModel, ...geminiModels().filter((m) => m !== workingModel)] : geminiModels();
+  const now = Date.now();
+  const ordered = workingModel ? [workingModel, ...geminiModels().filter((m) => m !== workingModel)] : geminiModels();
+  // Modelos que falharam há pouco vão para o fim da fila por 2 minutos.
+  const models = [...ordered.filter((m) => (coolDown.get(m) ?? 0) < now), ...ordered.filter((m) => (coolDown.get(m) ?? 0) >= now)];
   let last: GeminiError | null = null;
-  for (const model of models) {
-    const res = await fetch(`${API}/${encodeURIComponent(model)}:generateContent`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-goog-api-key": key },
-      body: JSON.stringify(body),
-      signal,
-      cache: "no-store",
-    });
+  for (let i = 0; i < models.length; i++) {
+    const model = models[i];
+    if (signal.aborted) break;
+    const payload = thinkingCfgOk
+      ? { ...body, generationConfig: { ...((body.generationConfig as object) ?? {}), thinkingConfig: { thinkingLevel: "low" } } }
+      : body;
+    let res: Response;
+    try {
+      res = await fetch(`${API}/${encodeURIComponent(model)}:generateContent`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-goog-api-key": key },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.any([signal, AbortSignal.timeout(perCallMs)]),
+        cache: "no-store",
+      });
+    } catch (e) {
+      if (signal.aborted) throw e;
+      console.error(`gemini ${model}: sem resposta em ${perCallMs} ms`);
+      last = new GeminiError(504, `${model} demorou mais de ${Math.round(perCallMs / 1000)} s`);
+      if (workingModel === model) workingModel = null;
+      coolDown.set(model, Date.now() + 120_000);
+      continue;
+    }
     const json = (await res.json().catch(() => ({}))) as GenResponse;
     if (res.ok) {
       workingModel = model;
@@ -56,8 +78,12 @@ async function geminiCallOnce(body: unknown, signal: AbortSignal): Promise<GenRe
     }
     const msg = cleanMsg(json.error?.message);
     console.error(`gemini ${model} ${res.status}: ${msg}`);
+    if (res.status === 400 && thinkingCfgOk && /thinking/i.test(msg)) {
+      thinkingCfgOk = false; // modelo não aceita o ajuste de raciocínio: repete o mesmo modelo sem ele
+      i--;
+      continue;
+    }
     last = new GeminiError(res.status, msg || res.statusText);
-    // Modelo inexistente, sobrecarregado (503/500) ou sem cota (429): tenta o próximo modelo grátis.
     if (
       res.status === 404 ||
       res.status === 429 ||
@@ -65,6 +91,7 @@ async function geminiCallOnce(body: unknown, signal: AbortSignal): Promise<GenRe
       (res.status === 400 && /model/i.test(msg) && /not found|not supported|unknown/i.test(msg))
     ) {
       if (workingModel === model) workingModel = null;
+      coolDown.set(model, Date.now() + 120_000);
       continue;
     }
     throw last;
@@ -72,14 +99,14 @@ async function geminiCallOnce(body: unknown, signal: AbortSignal): Promise<GenRe
   throw last ?? new GeminiError(500, "nenhum modelo disponível");
 }
 
-// Se todos os modelos estiverem sobrecarregados, espera um pouco e tenta mais uma vez.
-export async function geminiCall(body: unknown, signal: AbortSignal): Promise<GenResponse> {
+// Se todos os modelos falharem por sobrecarga, espera um pouco e tenta mais uma vez (se houver tempo).
+export async function geminiCall(body: Record<string, unknown>, signal: AbortSignal, perCallMs = 20000, deadline = Date.now() + 50000): Promise<GenResponse> {
   try {
-    return await geminiCallOnce(body, signal);
+    return await geminiCallOnce(body, signal, perCallMs);
   } catch (e) {
-    if (e instanceof GeminiError && (e.status >= 500 || e.status === 429) && !signal.aborted) {
-      await new Promise((r) => setTimeout(r, 2500));
-      return geminiCallOnce(body, signal);
+    if (e instanceof GeminiError && (e.status >= 500 || e.status === 429) && !signal.aborted && deadline - Date.now() > perCallMs + 4000) {
+      await new Promise((r) => setTimeout(r, 1500));
+      return geminiCallOnce(body, signal, perCallMs);
     }
     throw e;
   }
@@ -90,6 +117,7 @@ export function friendlyGeminiError(e: GeminiError): string {
   if (e.status === 401 || e.status === 403 || /API key|API_KEY/i.test(e.message))
     return "A chave da IA (GEMINI_API_KEY) foi recusada pelo Google. Confira a chave na Vercel.";
   if (e.status === 404) return "Nenhum modelo Gemini disponível para esta chave.";
+  if (e.status === 504) return "A IA do Google está lenta agora. Tente de novo em 1 minuto ou faça uma pergunta mais curta.";
   if (e.status >= 500) return "A IA do Google está sobrecarregada neste momento. Tente de novo em 1 minuto.";
   return `A IA recusou o pedido (${e.status}). Tente reformular a pergunta.`;
 }
@@ -139,7 +167,9 @@ export async function runGemini(opts: {
           tools,
           ...(lastRound ? { toolConfig: { functionCallingConfig: { mode: "NONE" } } } : {}),
         },
-        AbortSignal.any([opts.signal, AbortSignal.timeout(Math.max(5000, left - 3000))]),
+        AbortSignal.any([opts.signal, AbortSignal.timeout(Math.max(5000, left - 2000))]),
+        Math.min(15000, Math.max(5000, left - 3000)),
+        opts.deadline,
       );
     } catch (e) {
       if (e instanceof GeminiError) {

@@ -19,7 +19,7 @@ export async function GET() {
   if (process.env.GEMINI_API_KEY) {
     const t0 = Date.now();
     try {
-      await geminiCall({ contents: [{ role: "user", parts: [{ text: "Responda só: ok" }] }] }, AbortSignal.timeout(20000));
+      await geminiCall({ contents: [{ role: "user", parts: [{ text: "Responda só: ok" }] }] }, AbortSignal.timeout(25000), 8000, Date.now() + 25000);
       out.testeIA = `ok em ${Date.now() - t0} ms`;
     } catch (e) {
       out.testeIA = e instanceof GeminiError ? `erro ${e.status}: ${e.message}` : `erro: ${(e as Error).message}`;

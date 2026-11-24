@@ -15,6 +15,7 @@ export async function searchWeb(query: string, limit = 5): Promise<SearchHit[]> 
     headers: { Authorization: `Bearer ${key()}`, "Content-Type": "application/json" },
     body: JSON.stringify({ query, limit: Math.min(Math.max(limit, 1), 8), sources: ["web", "news"] }),
     cache: "no-store",
+    signal: AbortSignal.timeout(12000),
   });
   if (!res.ok) throw new Error(`Firecrawl search ${res.status}: ${(await res.text()).slice(0, 200)}`);
   const json = (await res.json()) as { data?: unknown };
@@ -48,8 +49,9 @@ export async function readPage(url: string): Promise<{ url: string; title: strin
   const res = await fetch(`${API}/scrape`, {
     method: "POST",
     headers: { Authorization: `Bearer ${key()}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ url, formats: ["markdown"], onlyMainContent: true }),
+    body: JSON.stringify({ url, formats: ["markdown"], onlyMainContent: true, timeout: 12000 }),
     cache: "no-store",
+    signal: AbortSignal.timeout(15000),
   });
   if (!res.ok) throw new Error(`Firecrawl scrape ${res.status}: ${(await res.text()).slice(0, 200)}`);
   const json = (await res.json()) as { data?: { markdown?: string; metadata?: { title?: string } } };

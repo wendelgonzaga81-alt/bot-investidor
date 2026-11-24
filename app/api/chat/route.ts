@@ -112,6 +112,27 @@ export async function POST(req: Request) {
 
   const last = messages[messages.length - 1];
   if (!last || last.role !== "user") return new Response("Pedido inválido.", { status: 400 });
+  // Comando de início: resposta imediata, sem IA (não depende de cotações nem notícias).
+  if (/^\s*hello\s+invest\s+moment\b/i.test(last.content)) {
+    const nome = parsed.data.name.replace(/\s+/g, " ").trim().slice(0, 80) || "investidor";
+    const hora = new Intl.DateTimeFormat("pt-BR", { timeZone: "America/Sao_Paulo", timeStyle: "short" }).format(new Date());
+    const h = Number(new Intl.DateTimeFormat("pt-BR", { timeZone: "America/Sao_Paulo", hour: "numeric", hourCycle: "h23" }).format(new Date()));
+    const saud = h < 12 ? "Bom dia" : h < 18 ? "Boa tarde" : "Boa noite";
+    return new Response(
+      `${saud}, **${nome}**! Eu sou o Invest Moment, seu analista da B3 (${hora} em Brasília).\n\n` +
+        "**O que posso fazer:**\n" +
+        "- **Qual ação está melhor para os próximos 20 pregões?**\n" +
+        "- **Bolsa hoje**: resumo do mercado\n" +
+        "- **Analise PETR4**: análise de uma ação\n" +
+        "- **Previsão de VALE3**: viés para os próximos pregões\n" +
+        "- **Compare ITUB4 e BBDC4**\n" +
+        "- **Onde estão os olhos dos investidores?**\n" +
+        "- **Mostre um gráfico de WEGE3**\n\n" +
+        "⚠️ Análise informativa, pode conter erros. Não é garantia de resultado.",
+      { headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" } },
+    );
+  }
+
   if (looksLikeInjection(last.content)) {
     securityLog("prompt_injection", {
       ip: req.headers.get("x-real-ip") ?? req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? "desconhecido",
