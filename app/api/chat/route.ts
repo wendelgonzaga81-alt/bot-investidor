@@ -9,7 +9,8 @@ export const runtime = "nodejs";
 export const maxDuration = 60;
 
 const ANTHROPIC_MODEL = "claude-opus-5-5";
-const MAX_TOOL_ROUNDS = 6;
+const MAX_TOOL_ROUNDS = 4;
+const DEADLINE_MS = 55_000; // termina antes do limite de 60 s da função na Vercel
 
 const Body = z.object({
   name: z.string().max(80).optional().default(""),
@@ -123,6 +124,7 @@ export async function POST(req: Request) {
   }
 
   const encoder = new TextEncoder();
+  const started = Date.now();
   const body = new ReadableStream<Uint8Array>({
     async start(controller) {
       const write = (s: string) => controller.enqueue(encoder.encode(scrubSecrets(s)));
@@ -134,6 +136,7 @@ export async function POST(req: Request) {
             write,
             signal: req.signal,
             maxRounds: MAX_TOOL_ROUNDS,
+            deadline: started + DEADLINE_MS,
           });
         } else {
           await runAnthropic({ name: parsed.data.name, messages, write, signal: req.signal });

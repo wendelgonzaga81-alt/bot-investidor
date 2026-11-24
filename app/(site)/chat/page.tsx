@@ -99,7 +99,10 @@ export default function ChatPage() {
           messages: history.filter((m) => !m.chart && m.content).map(({ role, content }) => ({ role, content })),
         }),
       });
-      if (!res.ok || !res.body) throw new Error(await res.text());
+      if (!res.ok || !res.body) {
+        const t = (await res.text().catch(() => "")).slice(0, 300);
+        throw new Error(t || `Erro ${res.status}.`);
+      }
       const reader = res.body.getReader();
       const dec = new TextDecoder();
       let acc = "";
@@ -109,6 +112,7 @@ export default function ChatPage() {
         acc += dec.decode(value, { stream: true });
         setMsgs((m) => [...m.slice(0, -1), { role: "assistant", content: acc }]);
       }
+      if (!acc.trim()) throw new Error("A resposta veio vazia. Tente de novo.");
     } catch (e) {
       setMsgs((m) => [...m.slice(0, -1), { role: "assistant", content: `Não consegui responder agora. ${(e as Error).message}` }]);
     } finally {
